@@ -23,25 +23,23 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 
 
 BASE = Path(__file__).resolve().parent
-SOURCE = BASE / "ERP使用情况.xlsx"
+SOURCE = BASE / "ERP使用情况-01.xlsx"
 OUT_DIR = BASE / "outputs"
-ROSTER_SHEET = "职能部门人员台账"
+REPORT_STEM = "职能部门ERP系统操作分析报告"
+OUT_MD = OUT_DIR / f"{REPORT_STEM}.md"
+OUT_DOCX = OUT_DIR / f"{REPORT_STEM}.docx"
+OUT_PDF = OUT_DIR / f"{REPORT_STEM}.pdf"
 WORD_FONT = "微软雅黑"
 
 
 @dataclass
 class ReportData:
-    sheet_name: str
-    report_stem: str
     source_name: str
-    totals: dict[str, float]
+    total_row: pd.Series
     roster_count: int
     matched_people: int
     no_ops_count: int
     source_participants: int
-    raw_participants: int
-    excluded_participants: int
-    raw_processes: float
     ops_not_roster: list[str]
     dept_mismatch: pd.DataFrame
     dept_rows: list[list[str]]
@@ -72,16 +70,10 @@ def pct(num, den) -> str:
     return f"{num / den * 100:.1f}%"
 
 
-def safe_filename(text: str) -> str:
-    for char in '\\/:*?"<>|':
-        text = text.replace(char, "_")
-    return text.strip()
-
-
 def markdown_table(headers: list[str], rows: Iterable[Iterable[str]]) -> str:
     lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(["---"] * len(headers)) + " |"]
     for row in rows:
-        escaped = [str(value).replace("\n", "<br>") for value in row]
+        escaped = [str(v).replace("\n", "<br>") for v in row]
         lines.append("| " + " | ".join(escaped) + " |")
     return "\n".join(lines)
 
@@ -90,17 +82,12 @@ def make_rows(df: pd.DataFrame, columns: list[str]) -> list[list[str]]:
     return [[str(row[col]) for col in columns] for _, row in df.iterrows()]
 
 
-def load_inputs() -> tuple[list[str], dict[str, pd.DataFrame], pd.DataFrame]:
-    xl = pd.ExcelFile(SOURCE)
-    operation_sheets = xl.sheet_names[:3]
-    operation_frames = {sheet: pd.read_excel(SOURCE, sheet_name=sheet) for sheet in operation_sheets}
-    roster = pd.read_excel(SOURCE, sheet_name=ROSTER_SHEET)
-    return operation_sheets, operation_frames, roster
+def analyze() -> ReportData:
+    summary = pd.read_excel(SOURCE, sheet_name="职能部门ERP操作汇总")
+    ops = pd.read_excel(SOURCE, sheet_name="职能部门人员ERP操作")
+    roster = pd.read_excel(SOURCE, sheet_name="职能部门人员台账")
 
-
-def normalize_inputs(ops: pd.DataFrame, roster: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    ops = ops.copy()
-    roster = roster.copy()
+    summary["部门"] = clean_text(summary["部门"])
     ops["部门"] = clean_text(ops["部门"])
     ops["人员名称"] = clean_text(ops["人员名称"])
     ops["参与类型"] = clean_text(ops["参与类型"])
@@ -108,34 +95,8 @@ def normalize_inputs(ops: pd.DataFrame, roster: pd.DataFrame) -> tuple[pd.DataFr
     roster["姓名"] = clean_text(roster["姓名"])
     roster["职位"] = clean_text(roster.get("职位", pd.Series([""] * len(roster))))
     roster["在职状态"] = clean_text(roster.get("在职状态", pd.Series([""] * len(roster))))
-    for col in ["参与流程数量", "处理时间（分钟）", "驳回次数", "有效评论次数"]:
-        ops[col] = pd.to_numeric(ops[col], errors="coerce").fillna(0)
-    return ops, roster
 
-
-def analyze_sheet(sheet_name: str, ops_raw: pd.DataFrame, roster_raw: pd.DataFrame) -> ReportData:
-    ops, roster = normalize_inputs(ops_raw, roster_raw)
-    roster_unique = roster.drop_duplicates(["姓名"]).copy()
-    roster_names = set(roster_unique["姓名"])
-    roster_departments = set(roster_unique["部门"])
-    raw_active_ops = ops[ops["参与流程数量"].gt(0)].copy()
-    raw_participants = raw_active_ops["人员名称"].nunique()
-    raw_processes = float(raw_active_ops["参与流程数量"].sum())
-    ops = ops[ops["人员名称"].isin(roster_names) & ops["部门"].isin(roster_departments)].copy()
-    excluded_participants = raw_participants - ops.loc[ops["参与流程数量"].gt(0), "人员名称"].nunique()
-
-    total_start = float(ops.loc[ops["参与类型"] == "发起者", "参与流程数量"].sum())
-    total_approve = float(ops.loc[ops["参与类型"] == "参与审批者", "参与流程数量"].sum())
-    total_processes = float(ops["参与流程数量"].sum())
-    totals = {
-        "发起流程总数": total_start,
-        "审批流程总数": total_approve,
-        "流程总量": total_processes,
-        "处理时间分钟": float(ops["处理时间（分钟）"].sum()),
-        "驳回次数": float(ops["驳回次数"].sum()),
-        "有效评论次数": float(ops["有效评论次数"].sum()),
-    }
-
+    total_row = summary[summary["部门"] == "合计"].iloc[0]
     person_ops_dept = (
         ops.groupby(["部门", "人员名称"], as_index=False)
         .agg(
@@ -178,6 +139,7 @@ def analyze_sheet(sheet_name: str, ops_raw: pd.DataFrame, roster_raw: pd.DataFra
         .sort_values("参与流程数量", ascending=False)
     )
 
+    roster_unique = roster.drop_duplicates(["姓名"]).copy()
     merged = roster_unique.merge(person_ops, left_on="姓名", right_on="人员名称", how="left")
     for col in ["参与流程数量", "处理时间分钟", "驳回次数", "有效评论次数", "发起者", "参与审批者"]:
         merged[col] = merged[col].fillna(0)
@@ -188,12 +150,13 @@ def analyze_sheet(sheet_name: str, ops_raw: pd.DataFrame, roster_raw: pd.DataFra
         labels=["无记录", "低频(1-99)", "中频(100-999)", "高频(1000+)"],
     )
 
-    ops_names = set(person_ops.loc[person_ops["参与流程数量"].gt(0), "人员名称"])
+    ops_names = set(person_ops["人员名称"])
+    roster_names = set(roster_unique["姓名"])
     ops_not_roster = sorted(ops_names - roster_names)
     dept_mismatch = merged[
         merged["是否有操作记录"]
         & merged["ERP记录部门"].notna()
-        & merged.apply(lambda row: row["部门"] not in str(row["ERP记录部门"]).split("、"), axis=1)
+        & merged.apply(lambda r: r["部门"] not in str(r["ERP记录部门"]).split("、"), axis=1)
     ][["姓名", "部门", "ERP记录部门"]].sort_values("姓名")
 
     dept_roster = (
@@ -212,25 +175,21 @@ def analyze_sheet(sheet_name: str, ops_raw: pd.DataFrame, roster_raw: pd.DataFra
     dept_roster["覆盖率"] = dept_roster.apply(lambda row: pct(row["有操作人数"], row["台账人数"]), axis=1)
     dept_roster = dept_roster.sort_values(["操作流程合计", "台账人数"], ascending=False)
 
-    role_totals = (
-        ops.groupby("参与类型", as_index=False)
-        .agg(
-            参与流程数量=("参与流程数量", "sum"),
-            处理时间分钟=("处理时间（分钟）", "sum"),
-            驳回次数=("驳回次数", "sum"),
-            有效评论次数=("有效评论次数", "sum"),
-        )
-        .query("参与流程数量 > 0")
+    role_totals = ops.groupby("参与类型", as_index=False).agg(
+        参与流程数量=("参与流程数量", "sum"),
+        处理时间分钟=("处理时间（分钟）", "sum"),
+        驳回次数=("驳回次数", "sum"),
+        有效评论次数=("有效评论次数", "sum"),
     )
-    total_role_flows = role_totals["参与流程数量"].sum()
+    total_flows = role_totals["参与流程数量"].sum()
 
     no_ops = merged[~merged["是否有操作记录"]].sort_values(["部门", "姓名"])
     no_ops_by_dept = (
         no_ops.groupby("部门")["姓名"]
-        .apply(lambda names: "、".join(names.tolist()))
+        .apply(lambda s: "、".join(s.tolist()))
         .reset_index(name="未操作人员")
     )
-    no_ops_by_dept["人数"] = no_ops_by_dept["未操作人员"].apply(lambda value: len(value.split("、")) if value else 0)
+    no_ops_by_dept["人数"] = no_ops_by_dept["未操作人员"].apply(lambda x: len(x.split("、")) if x else 0)
     no_ops_by_dept = no_ops_by_dept.sort_values(["人数", "部门"], ascending=[False, True])
 
     tier = (
@@ -249,25 +208,16 @@ def analyze_sheet(sheet_name: str, ops_raw: pd.DataFrame, roster_raw: pd.DataFra
 
     matched_people = int(merged["是否有操作记录"].sum())
     no_ops_count = int(len(no_ops))
-    source_participants = len(ops_names)
-    report_stem = f"{safe_filename(sheet_name)}职能部门ERP系统操作分析报告"
+    source_participants = int(total_row["参与人数"])
+    total_processes = total_row["发起流程总数"] + total_row["审批流程总数"]
 
     bullets = [
-        f"流程总量为{fmt_int(totals['流程总量'])}次，其中审批流程{fmt_int(totals['审批流程总数'])}次，占{pct(totals['审批流程总数'], totals['流程总量'])}；发起流程{fmt_int(totals['发起流程总数'])}次。",
-        f"驳回共{fmt_int(totals['驳回次数'])}次、有效评论{fmt_int(totals['有效评论次数'])}次；驳回主要发生在审批相关角色，说明退回和意见表达主要沉淀在审批环节。",
-        "资产财务部、公司领导、合同管理部、物资部、项目管理公司等部门通常承担较高流程处理压力，应结合各周期具体表格结果重点关注。",
-        f"本报告已按职能部门人员台账进行过滤：原操作表中有实际流程量的参与人员为{fmt_int(raw_participants)}人，纳入职能部门台账口径分析的为{fmt_int(source_participants)}人，未纳入{fmt_int(excluded_participants)}人；原操作表流程量为{fmt_int(raw_processes)}次，纳入分析流程量为{fmt_int(totals['流程总量'])}次。",
+        f"流程总量为{fmt_int(total_processes)}次，其中审批流程{fmt_int(total_row['审批流程总数'])}次，占{pct(total_row['审批流程总数'], total_processes)}；发起流程{fmt_int(total_row['发起流程总数'])}次。",
+        f"驳回共{fmt_int(total_row['驳回次数'])}次、有效评论{fmt_int(total_row['有效评论次数'])}次；驳回均发生在“参与审批者”角色，说明退回和意见表达主要沉淀在审批环节。",
+        "资产财务部、公司领导、合同管理部、物资部、项目管理公司是流程量较高的部门，合计承担了绝大多数审批及处理压力。",
     ]
     if ops_not_roster:
-        if len(ops_not_roster) <= 10:
-            unmatched_text = "、".join(ops_not_roster)
-        else:
-            unmatched_text = "、".join(ops_not_roster[:10]) + f"等{fmt_int(len(ops_not_roster))}人"
-        bullets.append(
-            "数据口径需关注：该操作表包含职能部门台账外人员，人员台账未找到姓名的有实际操作记录人员为"
-            + unmatched_text
-            + "；本报告的部门覆盖、未操作人员等统计仍以职能部门人员台账为基准。"
-        )
+        bullets.append("数据口径需关注：操作明细中有记录但人员台账未找到姓名的人员为" + "、".join(ops_not_roster) + "。")
     if not dept_mismatch.empty:
         mismatch_text = "；".join(
             f"{row['姓名']}（台账部门：{row['部门']}，ERP记录部门：{row['ERP记录部门']}）"
@@ -281,33 +231,34 @@ def analyze_sheet(sheet_name: str, ops_raw: pd.DataFrame, roster_raw: pd.DataFra
 
     paragraphs = {
         "overall": (
-            f"基于“{sheet_name}”工作表，职能部门ERP操作呈现“覆盖面、审批端集中度、评论和驳回集中度并存”的特征。"
+            f"近一年职能部门ERP操作呈现“覆盖面较广、审批端高度集中、评论和驳回集中于少数流程岗位”的特征。"
             f"台账共{fmt_int(len(roster_unique))}人，其中{fmt_int(matched_people)}人在台账内匹配到操作记录，"
             f"{fmt_int(no_ops_count)}人未匹配到操作记录，台账口径覆盖率为{pct(matched_people, len(roster_unique))}。"
-            f"本报告仅纳入职能部门人员台账内部门和人员的ERP记录，台账外部门或台账外人员不参与本次分析。"
+            f"部门汇总表显示参与人数为{fmt_int(source_participants)}人，较台账姓名匹配口径多1人，差异来自操作明细中存在但台账未找到的人员。"
         ),
         "department": (
-            "从部门覆盖看，满覆盖部门说明相关岗位普遍参与了ERP流程；存在较多无记录人员的部门，需要结合岗位属性、授权状态、是否待岗及年度实际分工进一步判断。"
+            "从覆盖率看，资产财务部、公司领导、物资部、人力资源部、技术质量部、信息化中心等部门台账成员均有操作记录；"
+            "待岗人员、综合办公室、技术中心、市场开发部、项目管理公司存在较多未操作人员，应结合岗位属性判断是否属于正常无需使用ERP，或存在授权、流程分工未覆盖的情况。"
         ),
         "role": (
-            "角色结构上，审批流程数量通常高于发起流程数量，说明职能部门成员更多承担流程审核、把关、会签和管理反馈职能。"
-            "发起端主要体现流程提交，审批端更多承载纠偏、意见留痕和退回处理。"
+            "角色结构上，审批流程数量远高于发起流程数量，说明职能部门成员更多承担流程审核、把关、会签和管理反馈职能。"
+            "发起者角色没有驳回记录，评论数量也明显低于审批者，符合发起端提交、审批端纠偏的业务特征。"
         ),
         "people": (
-            "成员层面操作量集中度较高。流程量靠前人员多处于合同、财务、审计、项目管理等流程链条关键节点。"
-            "建议对高频人员关注授权备份、流程代理和异常积压风险，避免关键人员缺岗影响流程周转。"
+            "成员层面操作量集中度较高。袁雯雯、邢阳、李玉生、朱彬、高英昌、马言、孙艳强等人员流程量居前，"
+            "反映这些岗位在合同、财务、审计、项目管理等流程链条中承担关键处理或审批节点。建议对高频人员关注授权备份、流程代理和异常积压风险，避免关键人员缺岗影响流程周转。"
         ),
         "comments": (
-            "驳回次数靠前人员集中在核心审批和校验岗位，说明这些岗位对流程合规性、资料完整性或业务条件的校验较多。"
-            "评论次数靠前人员与驳回高频人员往往存在重合，表明有效评论承担了补充说明、修改指引和审批意见留痕作用。"
+            "驳回次数靠前人员集中在合同管理部、资产财务部、物资部、项目管理公司和公司领导层，说明这些岗位对流程合规性、资料完整性或业务条件的校验较多。"
+            "评论次数靠前人员与驳回高频人员高度重合，表明有效评论很可能承担了补充说明、修改指引和审批意见留痕作用。"
         ),
         "no_ops": (
             "无操作人员不必然代表异常，需结合岗位职责、是否待岗、是否需要ERP授权等情况综合判断。"
-            "但对在职且岗位应参与流程的人员，建议由部门确认授权状态、流程节点配置及周期内实际分工。"
+            "但对在职且岗位应参与流程的人员，建议由部门确认授权状态、流程节点配置及年度实际分工。"
         ),
         "source": (
-            f"数据来源：{SOURCE.name}；操作口径：{sheet_name}；统计口径：以该操作表按部门、人员、参与类型汇总，"
-            "先按“职能部门人员台账”的部门和姓名过滤操作记录，再按姓名匹配台账；姓名可匹配且ERP记录部门属于台账部门范围但部门归属不同的人员，按台账部门纳入部门覆盖统计。"
+            f"数据来源：{SOURCE.name}；统计口径：以“职能部门人员ERP操作”按部门、人员、参与类型汇总，"
+            "并与“职能部门人员台账”按姓名匹配；姓名可匹配但部门口径不同的人员，按台账部门纳入部门覆盖统计。"
         ),
     }
 
@@ -329,7 +280,7 @@ def analyze_sheet(sheet_name: str, ops_raw: pd.DataFrame, roster_raw: pd.DataFra
         [
             row["参与类型"],
             fmt_int(row["参与流程数量"]),
-            pct(row["参与流程数量"], total_role_flows),
+            pct(row["参与流程数量"], total_flows),
             fmt_int(row["处理时间分钟"]),
             fmt_int(row["驳回次数"]),
             fmt_int(row["有效评论次数"]),
@@ -346,7 +297,7 @@ def analyze_sheet(sheet_name: str, ops_raw: pd.DataFrame, roster_raw: pd.DataFra
             fmt_int(row["驳回次数"]),
             fmt_int(row["有效评论次数"]),
         ]
-        for _, row in person_ops.loc[person_ops["参与流程数量"].gt(0)].head(15).iterrows()
+        for _, row in person_ops.head(15).iterrows()
     ]
     reject_top_rows = [
         [
@@ -368,19 +319,16 @@ def analyze_sheet(sheet_name: str, ops_raw: pd.DataFrame, roster_raw: pd.DataFra
         ]
         for _, row in person_ops.sort_values("有效评论次数", ascending=False).head(10).iterrows()
     ]
+    tier_rows = make_rows(tier, ["部门", "无记录", "低频(1-99)", "中频(100-999)", "高频(1000+)"])
+    no_ops_rows = make_rows(no_ops_by_dept, ["部门", "人数", "未操作人员"])
 
     return ReportData(
-        sheet_name=sheet_name,
-        report_stem=report_stem,
         source_name=SOURCE.name,
-        totals=totals,
+        total_row=total_row,
         roster_count=len(roster_unique),
         matched_people=matched_people,
         no_ops_count=no_ops_count,
         source_participants=source_participants,
-        raw_participants=raw_participants,
-        excluded_participants=excluded_participants,
-        raw_processes=raw_processes,
         ops_not_roster=ops_not_roster,
         dept_mismatch=dept_mismatch,
         dept_rows=dept_rows,
@@ -388,33 +336,31 @@ def analyze_sheet(sheet_name: str, ops_raw: pd.DataFrame, roster_raw: pd.DataFra
         top_people_rows=top_people_rows,
         reject_top_rows=reject_top_rows,
         comment_top_rows=comment_top_rows,
-        tier_rows=make_rows(tier, ["部门", "无记录", "低频(1-99)", "中频(100-999)", "高频(1000+)"]),
-        no_ops_rows=make_rows(no_ops_by_dept, ["部门", "人数", "未操作人员"]),
+        tier_rows=tier_rows,
+        no_ops_rows=no_ops_rows,
         bullets=bullets,
         paragraphs=paragraphs,
     )
 
 
-def output_paths(data: ReportData) -> tuple[Path, Path, Path]:
-    return (
-        OUT_DIR / f"{data.report_stem}.md",
-        OUT_DIR / f"{data.report_stem}.docx",
-        OUT_DIR / f"{data.report_stem}.pdf",
-    )
-
-
-def write_markdown(data: ReportData) -> Path:
-    out_md, _, _ = output_paths(data)
+def write_markdown(data: ReportData) -> None:
+    total_processes = data.total_row["发起流程总数"] + data.total_row["审批流程总数"]
     lines = [
-        f"# {data.sheet_name}职能部门成员ERP系统操作分析报告",
+        "# 职能部门成员ERP系统操作分析报告",
         "",
-        f"基于《{data.source_name}》中“{data.sheet_name}”与“职能部门人员台账”数据。",
+        f"基于《{data.source_name}》中“职能部门人员ERP操作”与“职能部门人员台账”数据。",
         "",
         "## 核心指标",
         "",
         markdown_table(
             ["台账人员", "有操作记录", "无操作记录", "操作覆盖率", "流程总量"],
-            [[fmt_int(data.roster_count), fmt_int(data.matched_people), fmt_int(data.no_ops_count), pct(data.matched_people, data.roster_count), fmt_int(data.totals["流程总量"])]],
+            [[
+                fmt_int(data.roster_count),
+                fmt_int(data.matched_people),
+                fmt_int(data.no_ops_count),
+                pct(data.matched_people, data.roster_count),
+                fmt_int(total_processes),
+            ]],
         ),
         "",
         "## 一、总体结论",
@@ -473,8 +419,7 @@ def write_markdown(data: ReportData) -> Path:
         data.paragraphs["source"],
         "",
     ])
-    out_md.write_text("\n".join(lines), encoding="utf-8")
-    return out_md
+    OUT_MD.write_text("\n".join(lines), encoding="utf-8")
 
 
 def set_cell_shading(cell, fill: str) -> None:
@@ -505,12 +450,14 @@ def set_doc_defaults(doc: Document) -> None:
     section.bottom_margin = Cm(2.54)
     section.left_margin = Cm(2.54)
     section.right_margin = Cm(2.54)
+
     normal = doc.styles["Normal"]
     normal.font.name = WORD_FONT
     normal._element.rPr.rFonts.set(qn("w:eastAsia"), WORD_FONT)
     normal.font.size = Pt(10.5)
     normal.paragraph_format.space_after = Pt(6)
     normal.paragraph_format.line_spacing = 1.1
+
     for style_name, size, color in [
         ("Title", 22, "0B2545"),
         ("Heading 1", 16, "2E74B5"),
@@ -581,20 +528,22 @@ def add_bullet(doc: Document, text: str) -> None:
     run.font.size = Pt(10.5)
 
 
-def write_docx(data: ReportData) -> Path:
-    _, out_docx, _ = output_paths(data)
+def write_docx(data: ReportData) -> None:
+    total_processes = data.total_row["发起流程总数"] + data.total_row["审批流程总数"]
     doc = Document()
     set_doc_defaults(doc)
+
     title = doc.add_paragraph(style="Title")
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    title.add_run(f"{data.sheet_name}职能部门成员ERP系统操作分析报告")
+    title.add_run("职能部门成员ERP系统操作分析报告")
     subtitle = doc.add_paragraph()
     subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = subtitle.add_run(f"基于《{data.source_name}》中“{data.sheet_name}”与“职能部门人员台账”数据")
+    run = subtitle.add_run(f"基于《{data.source_name}》中“职能部门人员ERP操作”与“职能部门人员台账”数据")
     run.font.name = WORD_FONT
     run._element.rPr.rFonts.set(qn("w:eastAsia"), WORD_FONT)
     run.font.size = Pt(10)
     run.font.color.rgb = RGBColor.from_string("44546A")
+
     add_kv_table(
         doc,
         [
@@ -602,32 +551,38 @@ def write_docx(data: ReportData) -> Path:
             ("有操作记录", fmt_int(data.matched_people)),
             ("无操作记录", fmt_int(data.no_ops_count)),
             ("操作覆盖率", pct(data.matched_people, data.roster_count)),
-            ("流程总量", fmt_int(data.totals["流程总量"])),
+            ("流程总量", fmt_int(total_processes)),
         ],
     )
     doc.add_heading("一、总体结论", level=1)
     doc.add_paragraph(data.paragraphs["overall"])
     for item in data.bullets:
         add_bullet(doc, item)
+
     doc.add_heading("二、部门覆盖与操作量", level=1)
     add_doc_table(doc, ["部门", "台账人数", "有操作", "无操作", "覆盖率", "发起", "审批", "驳回", "评论"], data.dept_rows, [2.4, 1.3, 1.3, 1.3, 1.4, 1.3, 1.5, 1.3, 1.3])
     doc.add_paragraph(data.paragraphs["department"])
+
     doc.add_heading("三、角色结构分析", level=1)
     add_doc_table(doc, ["角色", "流程数量", "占比", "处理时间(分钟)", "驳回", "有效评论"], data.role_rows, [2.4, 2, 1.5, 2.4, 1.5, 1.8])
     doc.add_paragraph(data.paragraphs["role"])
+
     doc.add_heading("四、成员操作强度", level=1)
     add_doc_table(doc, ["部门", "姓名", "流程合计", "发起", "审批", "驳回", "有效评论"], data.top_people_rows, [2.4, 1.7, 1.7, 1.4, 1.7, 1.4, 1.7])
     doc.add_paragraph(data.paragraphs["people"])
+
     doc.add_heading("五、评论与驳回情况", level=1)
     doc.add_heading("驳回次数前十", level=2)
     add_doc_table(doc, ["部门", "姓名", "流程合计", "驳回次数", "有效评论"], data.reject_top_rows, [2.5, 1.8, 2, 1.8, 1.8])
     doc.add_paragraph(data.paragraphs["comments"])
     doc.add_heading("有效评论前十", level=2)
     add_doc_table(doc, ["部门", "姓名", "流程合计", "驳回次数", "有效评论"], data.comment_top_rows, [2.5, 1.8, 2, 1.8, 1.8])
+
     doc.add_heading("六、未操作人员与分层", level=1)
     add_doc_table(doc, ["部门", "无记录", "低频(1-99)", "中频(100-999)", "高频(1000+)"], data.tier_rows, [3, 1.6, 2, 2, 2])
     doc.add_paragraph(data.paragraphs["no_ops"])
     add_doc_table(doc, ["部门", "未操作人数", "未操作人员"], data.no_ops_rows, [2.4, 1.8, 10.2])
+
     doc.add_heading("七、管理建议", level=1)
     for item in [
         "按部门复核无操作人员名单，区分“无需使用ERP”“授权未开通”“流程节点未配置”“岗位变动/离职待更新”等原因。",
@@ -637,8 +592,7 @@ def write_docx(data: ReportData) -> Path:
     ]:
         add_bullet(doc, item)
     doc.add_paragraph(data.paragraphs["source"])
-    doc.save(out_docx)
-    return out_docx
+    doc.save(OUT_DOCX)
 
 
 def resolve_pdf_font() -> str:
@@ -666,7 +620,7 @@ def pdf_paragraph(text: str, style: ParagraphStyle) -> Paragraph:
 
 
 def pdf_table(headers: list[str], rows: list[list[str]], style: ParagraphStyle, col_widths: list[float] | None = None) -> Table:
-    table_data = [[pdf_paragraph(header, style) for header in headers]]
+    table_data = [[pdf_paragraph(h, style) for h in headers]]
     table_data.extend([[pdf_paragraph(value, style) for value in row] for row in rows])
     table = Table(table_data, colWidths=col_widths, repeatRows=1)
     table.setStyle(
@@ -688,8 +642,7 @@ def pdf_table(headers: list[str], rows: list[list[str]], style: ParagraphStyle, 
     return table
 
 
-def write_pdf(data: ReportData) -> Path:
-    _, _, out_pdf = output_paths(data)
+def write_pdf(data: ReportData) -> None:
     font = resolve_pdf_font()
     styles = getSampleStyleSheet()
     title_style = ParagraphStyle("ChineseTitle", parent=styles["Title"], fontName=font, fontSize=20, leading=26, alignment=TA_CENTER, textColor=colors.HexColor("#0B2545"), spaceAfter=8)
@@ -698,13 +651,22 @@ def write_pdf(data: ReportData) -> Path:
     h2 = ParagraphStyle("ChineseH2", parent=styles["Heading2"], fontName=font, fontSize=11, leading=15, textColor=colors.HexColor("#1F4D78"), spaceBefore=8, spaceAfter=4)
     body = ParagraphStyle("ChineseBody", parent=styles["BodyText"], fontName=font, fontSize=9, leading=14, alignment=TA_LEFT, spaceAfter=6)
     small = ParagraphStyle("ChineseSmall", parent=body, fontSize=7, leading=10)
-    doc = SimpleDocTemplate(str(out_pdf), pagesize=landscape(A4), leftMargin=1.2 * cm, rightMargin=1.2 * cm, topMargin=1.2 * cm, bottomMargin=1.2 * cm)
+
+    doc = SimpleDocTemplate(
+        str(OUT_PDF),
+        pagesize=landscape(A4),
+        leftMargin=1.2 * cm,
+        rightMargin=1.2 * cm,
+        topMargin=1.2 * cm,
+        bottomMargin=1.2 * cm,
+    )
+    total_processes = data.total_row["发起流程总数"] + data.total_row["审批流程总数"]
     story = [
-        pdf_paragraph(f"{data.sheet_name}职能部门成员ERP系统操作分析报告", title_style),
-        pdf_paragraph(f"基于《{data.source_name}》中“{data.sheet_name}”与“职能部门人员台账”数据", subtitle_style),
+        pdf_paragraph("职能部门成员ERP系统操作分析报告", title_style),
+        pdf_paragraph(f"基于《{data.source_name}》中“职能部门人员ERP操作”与“职能部门人员台账”数据", subtitle_style),
         pdf_table(
             ["台账人员", "有操作记录", "无操作记录", "操作覆盖率", "流程总量"],
-            [[fmt_int(data.roster_count), fmt_int(data.matched_people), fmt_int(data.no_ops_count), pct(data.matched_people, data.roster_count), fmt_int(data.totals["流程总量"])]],
+            [[fmt_int(data.roster_count), fmt_int(data.matched_people), fmt_int(data.no_ops_count), pct(data.matched_people, data.roster_count), fmt_int(total_processes)]],
             body,
             [3.2 * cm, 3.2 * cm, 3.2 * cm, 3.2 * cm, 3.2 * cm],
         ),
@@ -713,12 +675,14 @@ def write_pdf(data: ReportData) -> Path:
         pdf_paragraph(data.paragraphs["overall"], body),
     ]
     story.extend(pdf_paragraph(f"• {item}", body) for item in data.bullets)
-    for title, paragraph, headers, rows in [
+    sections = [
         ("二、部门覆盖与操作量", data.paragraphs["department"], ["部门", "台账人数", "有操作", "无操作", "覆盖率", "发起", "审批", "驳回", "评论"], data.dept_rows),
         ("三、角色结构分析", data.paragraphs["role"], ["角色", "流程数量", "占比", "处理时间(分钟)", "驳回", "有效评论"], data.role_rows),
         ("四、成员操作强度", data.paragraphs["people"], ["部门", "姓名", "流程合计", "发起", "审批", "驳回", "有效评论"], data.top_people_rows),
-    ]:
+    ]
+    for title, paragraph, headers, rows in sections:
         story.extend([pdf_paragraph(title, h1), pdf_table(headers, rows, small), pdf_paragraph(paragraph, body)])
+
     story.extend([
         pdf_paragraph("五、评论与驳回情况", h1),
         pdf_paragraph("驳回次数前十", h2),
@@ -741,18 +705,17 @@ def write_pdf(data: ReportData) -> Path:
         story.append(pdf_paragraph(f"• {item}", body))
     story.append(pdf_paragraph(data.paragraphs["source"], body))
     doc.build(story)
-    return out_pdf
 
 
 def main() -> None:
     OUT_DIR.mkdir(exist_ok=True)
-    operation_sheets, operation_frames, roster = load_inputs()
-    generated: list[Path] = []
-    for sheet in operation_sheets:
-        data = analyze_sheet(sheet, operation_frames[sheet], roster)
-        generated.extend([write_markdown(data), write_docx(data), write_pdf(data)])
-    for path in generated:
-        print(path)
+    data = analyze()
+    write_markdown(data)
+    write_docx(data)
+    write_pdf(data)
+    print(OUT_MD)
+    print(OUT_DOCX)
+    print(OUT_PDF)
 
 
 if __name__ == "__main__":
