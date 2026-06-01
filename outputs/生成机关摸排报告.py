@@ -286,13 +286,22 @@ def enrich_supervisor_score(rec: dict) -> None:
     rec["规则重算一致性"] = "一致" if rec.get("自动生成评级") == rec.get("规则重算评级") else "不一致"
 
 
-def load_supervisor():
-    df = latest_person_rows(read_sheet1(latest("部门成员工作主管评定", ".xlsx")), "成员姓名", "成员部门", "评价时间(必填)")
+def load_supervisor_evaluations(deduplicate: bool = False):
+    df = read_sheet1(latest("部门成员工作主管评定", ".xlsx"))
+    df = df[df["成员姓名"].notna() & df["成员部门"].isin(SCOPE_DEPTS)].copy()
+    df["评价时间(必填)"] = df["评价时间(必填)"].astype(str)
+    df = df.sort_values(["成员部门", "成员姓名", "评价时间(必填)"])
+    if deduplicate:
+        df = df.drop_duplicates(["成员部门", "成员姓名"], keep="last")
     records = []
     for rec in df.to_dict("records"):
         enrich_supervisor_score(rec)
         records.append(rec)
     return records
+
+
+def load_supervisor():
+    return load_supervisor_evaluations(deduplicate=True)
 
 
 def load_workload():
@@ -353,7 +362,9 @@ def build_supervisor_report(records):
 
 ## 二、整体结果
 
-- 纳入测算样本：`{len(records)}` 人
+- 纳入测算评价记录：`{len(records)}` 条
+- 涉及员工：`{len({clean(r.get("成员姓名")) for r in records})}` 人
+- 同一员工如存在多名主管评价，按主管分别列示，不合并、不去重。
 
 ### 1. 三类等级分布
 
@@ -371,7 +382,7 @@ def build_supervisor_report(records):
 
 ## 四、人员明细
 
-{table(["部门", "姓名", "纯20题总分", "岗位必要性修正分", "综合重算总分", "综合重算等级", "综合重算等级对应薪资中位数", "主管评价等级", "主管评价等级对应薪资中位数"], [[clean(r.get("成员部门")), clean(r.get("成员姓名")), fmt(r.get("纯20题总分")), fmt(r.get("岗位必要性修正分")), fmt(r.get("规则重算总分")), clean(r.get("规则重算评级")), SALARY.get(clean(r.get("规则重算评级")), ""), clean(r.get("主管主观评级")), SALARY.get(clean(r.get("主管主观评级")), "")] for r in sorted(records, key=lambda x: (SCOPE_DEPTS.index(clean(x.get("成员部门"))) if clean(x.get("成员部门")) in SCOPE_DEPTS else 99, -num(x.get("规则重算总分"))))])}
+{table(["部门", "姓名", "主管姓名", "评价时间", "纯20题总分", "岗位必要性修正分", "综合重算总分", "综合重算等级", "综合重算等级对应薪资中位数", "主管评价等级", "主管评价等级对应薪资中位数"], [[clean(r.get("成员部门")), clean(r.get("成员姓名")), clean(r.get("主管姓名(必填)")), clean(r.get("评价时间(必填)")), fmt(r.get("纯20题总分")), fmt(r.get("岗位必要性修正分")), fmt(r.get("规则重算总分")), clean(r.get("规则重算评级")), SALARY.get(clean(r.get("规则重算评级")), ""), clean(r.get("主管主观评级")), SALARY.get(clean(r.get("主管主观评级")), "")] for r in sorted(records, key=lambda x: (SCOPE_DEPTS.index(clean(x.get("成员部门"))) if clean(x.get("成员部门")) in SCOPE_DEPTS else 99, clean(x.get("成员姓名")), clean(x.get("评价时间(必填)"))))])}
 """
     return md
 
@@ -2307,11 +2318,12 @@ def write_report(stem: str, md: str) -> Path:
 
 def main():
     supervisor = load_supervisor()
+    supervisor_evaluations = load_supervisor_evaluations()
     workload = load_workload()
 
     outputs = []
     items = [
-        ("机关员工主管评价20题重算报告", build_supervisor_report(supervisor)),
+        ("机关员工主管评价20题重算报告", build_supervisor_report(supervisor_evaluations)),
         ("机关员工ERP使用情况分析", build_erp_report(supervisor)),
     ]
     workload_md, workload_records = build_workload_report(workload, supervisor)
@@ -2333,7 +2345,8 @@ def main():
     for p in outputs:
         print(p.name)
     print(f"工作摸排样本：{len(workload)}")
-    print(f"主管评价样本：{len(supervisor)}")
+    print(f"主管评价人员：{len(supervisor)}")
+    print(f"主管评价记录：{len(supervisor_evaluations)}")
 
 
 if __name__ == "__main__":

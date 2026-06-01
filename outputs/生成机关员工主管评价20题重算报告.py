@@ -194,7 +194,7 @@ def load_records() -> tuple[list[dict], Path, Path]:
     frame = frame.loc[:, [col for col in frame.columns if not str(col).startswith("Unnamed:")]]
     frame = frame[frame["成员姓名"].notna() & frame["成员部门"].isin(SCOPE_DEPTS)].copy()
     frame["评价时间(必填)"] = frame["评价时间(必填)"].astype(str)
-    frame = frame.sort_values("评价时间(必填)").drop_duplicates(["成员部门", "成员姓名"], keep="last")
+    frame = frame.sort_values(["成员部门", "成员姓名", "评价时间(必填)"])
     rules = load_rule_scores()
     records = frame.to_dict("records")
     for record in records:
@@ -240,6 +240,8 @@ def build_report(records: list[dict], excel_path: Path, rule_path: Path) -> str:
         detail.append([
             clean(record.get("成员部门")),
             clean(record.get("成员姓名")),
+            clean(record.get("主管姓名(必填)")),
+            clean(record.get("评价时间(必填)")),
             fmt(record.get("纯20题总分")),
             fmt(record.get("岗位必要性修正分")),
             fmt(record.get("规则重算总分")),
@@ -256,7 +258,9 @@ def build_report(records: list[dict], excel_path: Path, rule_path: Path) -> str:
 
 ## 二、整体结果
 
-- 纳入测算样本：`{len(records)}` 人
+- 纳入测算评价记录：`{len(records)}` 条
+- 涉及员工：`{len({clean(record.get("成员姓名")) for record in records})}` 人
+- 同一员工如存在多名主管评价，按主管分别列示，不合并、不去重。
 
 ### 1. 三类等级分布
 
@@ -274,7 +278,7 @@ def build_report(records: list[dict], excel_path: Path, rule_path: Path) -> str:
 
 ## 四、人员明细
 
-{table(["部门", "姓名", "纯20题总分", "岗位必要性修正分", "综合重算总分", "综合重算等级", "综合重算等级对应薪资中位数", "主管评价等级", "主管评价等级对应薪资中位数"], detail)}
+{table(["部门", "姓名", "主管姓名", "评价时间", "纯20题总分", "岗位必要性修正分", "综合重算总分", "综合重算等级", "综合重算等级对应薪资中位数", "主管评价等级", "主管评价等级对应薪资中位数"], detail)}
 """
 
 
@@ -362,7 +366,8 @@ def main() -> None:
     markdown_to_pdf(md_path, pdf_path)
     print(f"主管评价文件：{excel_path.name}")
     print(f"赋分规则文件：{rule_path.name}")
-    print(f"纳入测算样本：{len(records)}")
+    print(f"纳入测算评价记录：{len(records)}")
+    print(f"涉及员工：{len({clean(record.get('成员姓名')) for record in records})}")
     print(f"生成文件：{md_path.name}")
     print(f"生成文件：{pdf_path.name}")
 
